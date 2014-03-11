@@ -280,107 +280,69 @@ sub fetch_all_by_Slice {
                e.g. "Mus musculus"
   Arg [3]    : string $alignment_type
                e.g. "BLASTZ_NET"
-  Arg [4]    : string $seq_region_name
-               e.g. "6-COX"
   Example    :
   Description:
-  Returntype : array with 3 elements
+  Returntype : An array with 3 elements, the name of the match, its
+               midpoint and strand
   Exceptions :
   Caller     :
 
 =cut
 
 sub interpolate_best_location {
-  my ($self,$slice,$species,$alignment_type,$seq_region_name) = @_;
+  my ($self, $slice, $species, $alignment_type) = @_;
 
-#warn $slice->name,"\t$species\t$alignment_type\t$seq_region_name";
+  my $dafs = $self->
+      fetch_all_by_Slice($slice, $species, undef, $alignment_type);
 
-  $| =1 ;
-  my $max_distance_for_clustering = 10000;
-  my $dafs = $self->fetch_all_by_Slice($slice, $species, undef, $alignment_type);
-  my %name_strand_clusters;
-  my $based_on_group_id = 1;
-  foreach my $daf (@{$dafs}) {
-    next if ($seq_region_name && $daf->hseqname ne $seq_region_name);
-    if (defined $daf->group_id && $daf->group_id > 0 && $alignment_type ne "TRANSLATED_BLAT") {
-      push @{$name_strand_clusters{$daf->group_id}}, $daf;
-    } else {
-      $based_on_group_id = 0 if ($based_on_group_id);
-      push @{$name_strand_clusters{$daf->hseqname. "_" .$daf->hstrand}}, $daf;
-    }
+  my %daf_groups;
+
+  ## Group DAFs by their group_ids
+  foreach my $daf (@$dafs) {
+      push @{$daf_groups{$daf->group_id}}, $daf;
   }
 
-  if ($based_on_group_id) {
-    my @ordered_name_strands = sort {scalar @{$name_strand_clusters{$b}} <=> scalar @{$name_strand_clusters{$a}}} keys %name_strand_clusters;
+  ## Find the best scoring daf_group
+  my %daf_group_scores;
 
-    my @best_blocks = sort {$a->hstart <=> $b->hend} @{$name_strand_clusters{$ordered_name_strands[0]}||[]};
-
-    return undef if( !@best_blocks );
-    return ($best_blocks[0]->hseqname,
-            $best_blocks[0]->hstart
-            + int(($best_blocks[-1]->hend - $best_blocks[0]->hstart)/2),
-            $best_blocks[0]->hstrand * $slice->strand,
-            $best_blocks[0]->hstart,
-            $best_blocks[-1]->hend);
-
-  } else {
-
-    my @refined_clusters;
-    foreach my $name_strand (keys %name_strand_clusters) {
-      # an array of arrayrefs
-      # name, strand, start, end, nb of blocks
-      my @sub_clusters;
-      foreach my $block (sort {$a->hstart <=> $b->hstart} @{$name_strand_clusters{$name_strand}||[]}) {
-        unless (scalar @sub_clusters) {
-          push @sub_clusters, [$block->hseqname,$block->hstrand, $block->hstart, $block->hend, 1];
-          next;
-        }
-        my $block_clustered = 0;
-        foreach my $arrayref (@sub_clusters) {
-          my ($n,$st,$s,$e,$c) = @{$arrayref};
-          if ($block->hstart<=$e &&
-              $block->hend>=$s) {
-            # then overlaps.
-            $arrayref->[2] = $block->hstart if ($block->hstart < $s);
-            $arrayref->[3] = $block->hend if ($block->hend > $e);
-            $arrayref->[4]++;
-            $block_clustered = 1;
-          } elsif ($block->hstart <= $e + $max_distance_for_clustering &&
-                   $block->hstart > $e) {
-            # then is downstream
-            $arrayref->[3] = $block->hend;
-            $arrayref->[4]++;
-            $block_clustered = 1;
-          } elsif ($block->hend >= $s - $max_distance_for_clustering &&
-                   $block->hend < $s) {
-            # then is upstream
-            $arrayref->[2] = $block->hstart;
-            $arrayref->[4]++;
-            $block_clustered = 1;
-          }
-        }
-        unless ($block_clustered) {
-          # do not overlap anything already seen, so adding as new seeding cluster
-          push @sub_clusters, [$block->hseqname,$block->hstrand, $block->hstart, $block->hend, 1];
-        }
+  for my $group_id (keys %daf_groups){
+      my $dafs = $daf_groups{$group_id};
+      my ($matches, $length);
+      for my $daf (@$dafs){
+          my $alignment_strings = $daf->alignment_strings;
+          ## Note, both strings are the same length
+          $length  += length($alignment_strings->[0]);
+          ## Perl hack to count matches
+          $matches +=
+              ($alignment_strings->[0] ^
+               $alignment_strings->[1]) =~ tr/\0//;
       }
-      push @refined_clusters, @sub_clusters;
-    }
-
-    # sort by the max number of blocks desc
-    @refined_clusters = sort {$b->[-1] <=> $a->[-1]} @refined_clusters;
-
-    return undef if(!@refined_clusters);
-    return ($refined_clusters[0]->[0], #hseqname,
-            $refined_clusters[0]->[2]
-            + int(($refined_clusters[0]->[3] - $refined_clusters[0]->[2])/2),
-            $refined_clusters[0]->[1] * $slice->strand,
-            $refined_clusters[0]->[2],
-            $refined_clusters[0]->[3]);
-
+      $daf_group_scores{$group_id} = $matches/$length;
   }
-}
 
+  # TODO: We dont deal with ties
+  my $best_group =
+      (sort
+       {$daf_group_scores{$b} <=>
+        $daf_group_scores{$a}}
+       keys %daf_group_scores)[0];
+
+  ## Get some info for the best group
+  my $min_start = +1e99;
+  my $max_end   = -1e99;
+
+  ## TODO: Confirm hseqname and hstrand doesn't differ within groups
+  for (@{$daf_groups{$best_group}}){
+      $min_start = $_->hstart if $_->hstart < $min_start;
+      $max_end   = $_->hend   if $_->hend   > $max_end;
+  }
+
+  return (
+      $dafs->[0]->hseqname,
+      $min_start + int(($max_end - $min_start)/2),
+      $dafs->[0]->hstrand * $slice->strand,
+      );
+}
 
 =head2 deleteObj
 
